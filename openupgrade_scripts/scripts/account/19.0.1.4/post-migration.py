@@ -5,7 +5,35 @@ import re
 
 from openupgradelib import openupgrade
 
+from odoo.exceptions import UserError
 from odoo.orm.commands import Command
+
+
+def _partner_mapping_patterns(model_pattern, label_pattern, note_pattern):
+    """Hoist a shared initial IGNORECASE flag before embedding expressions.
+
+    Scoped Python flags are not a portable PostgreSQL solution. Different flag
+    settings cannot be merged without altering the individual expressions.
+    Keep the source table intact and stop rather than guessing in that case.
+    This fixes flag placement only, not the separate label/note scope mapping.
+    """
+    patterns = []
+    flag_sets = []
+    for pattern in (model_pattern, label_pattern, note_pattern):
+        body = pattern or ""
+        flags = set()
+        while match := re.match(r"^\(\?([aiLmsux]+)\)", body):
+            flags.update(match.group(1))
+            body = body[match.end() :]
+        if pattern and (body != ".*" or flags - {"i"}):
+            flag_sets.append(flags)
+        patterns.append(body)
+    if any(flags - {"i"} for flags in flag_sets) or (
+        flag_sets and any(flags != flag_sets[0] for flags in flag_sets)
+    ):
+        raise ValueError("Incompatible partner mapping regex flags")
+    prefix = "(?i)" if flag_sets and flag_sets[0] else ""
+    return prefix, *patterns
 
 
 def account_reconcile_model(env):
@@ -55,19 +83,6 @@ def account_reconcile_model_partner_mapping(env):
         narration_regexes,
     ) in env.cr.fetchall():
         reconcile_model = AccountReconcileModel.browse(reconcile_model_id)
-        match_regex_lookahead = ""
-        if reconcile_model.match_label_param:
-            if reconcile_model.match_label == "contains":
-                match_regex_lookahead = (
-                    f"(?=.*{re.escape(reconcile_model.match_label_param)}.*)"
-                )
-            elif reconcile_model.match_label == "not_contains":
-                match_regex_lookahead = (
-                    f"(?!{re.escape(reconcile_model.match_label_param)})"
-                )
-            elif reconcile_model.match_label == "match_regex":
-                match_regex_lookahead = f"(?={reconcile_model.match_label_param})"
-
         for mapping_id, partner_id, payment_ref_regex, narration_regex in zip(
             mapping_ids,
             partner_ids,
@@ -75,18 +90,54 @@ def account_reconcile_model_partner_mapping(env):
             narration_regexes,
             strict=True,
         ):
+            try:
+                prefix, model_pattern, label_pattern, note_pattern = (
+                    _partner_mapping_patterns(
+                        reconcile_model.match_label_param
+                        if reconcile_model.match_label == "match_regex"
+                        else None,
+                        payment_ref_regex,
+                        narration_regex,
+                    )
+                )
+            except ValueError as error:
+                raise UserError(
+                    env._(
+                        "Partner mapping expressions use different or unsupported "
+                        "global regex flags. They cannot be combined safely. Review "
+                        "the original mapping before retrying the migration; "
+                        "do not strip its flags."
+                    )
+                ) from error
+            match_regex_lookahead = ""
+            if (
+                reconcile_model.match_label_param
+                and reconcile_model.match_label == "contains"
+            ):
+                match_regex_lookahead = (
+                    f"(?=.*{re.escape(reconcile_model.match_label_param)}.*)"
+                )
+            elif (
+                reconcile_model.match_label_param
+                and reconcile_model.match_label == "not_contains"
+            ):
+                match_regex_lookahead = (
+                    f"(?!{re.escape(reconcile_model.match_label_param)})"
+                )
+            elif reconcile_model.match_label == "match_regex":
+                match_regex_lookahead = f"(?={model_pattern})" if model_pattern else ""
             partner = ResPartner.browse(partner_id)
             match_regex = "|".join(
                 map(
                     lambda x: f"({x})",
-                    filter(None, [payment_ref_regex, narration_regex]),
+                    filter(None, [label_pattern, note_pattern]),
                 )
             )
             new_reconcile_model = reconcile_model.copy(
                 {
                     "name": reconcile_model.name + f" ({partner.name})",
                     "match_label": "match_regex",
-                    "match_label_param": match_regex_lookahead + match_regex,
+                    "match_label_param": prefix + match_regex_lookahead + match_regex,
                     "line_ids": [
                         Command.create(
                             {
